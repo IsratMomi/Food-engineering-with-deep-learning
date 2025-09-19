@@ -1,0 +1,11 @@
+torch
+torchvision
+tqdm
+matplotlib
+openai
+requests
+python-dotenv
+pandas
+scikit-learn
+diffusers
+transformers
