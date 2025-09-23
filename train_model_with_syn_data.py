@@ -36,7 +36,8 @@ DEVICE = torch.device("cpu")  # Force CPU
 # Defaults (CLI can override)
 # ----------------------------
 DEFAULT_DATA_ROOT = "./data"
-DEFAULT_SYNTH_ROOT = "./synthetic_data"
+# DEFAULT_SYNTH_ROOT = "./synthetic_data"
+DEFAULT_SYNTH_ROOT = os.path.join(DEFAULT_DATA_ROOT, "synthetic_data")
 DEFAULT_CKPT_DIR = "./checkpoints"
 DEFAULT_LAST = "resnet50_food101_last.pth"
 DEFAULT_BEST = "resnet50_food101_best.pth"
@@ -46,14 +47,14 @@ class_names = Food101(root="./data", download=False).classes
 
 # Training recipe
 DEFAULT_BATCH_SIZE = 16
-DEFAULT_EPOCHS = 30
+DEFAULT_EPOCHS = 25
 DEFAULT_LR = 1e-4
 DEFAULT_IMG_SIZE = 256
 NUM_WORKERS = 0  # Windows/VM safe
 
 # Pre/Post processing
 APPLY_CLAHE = True            # train-only
-APPLY_POSTPROCESS = False     # denoise is slow on CPU; keep off by default
+APPLY_POSTPROCESS = True     # denoise is slow on CPU; keep off by default
 
 # Regularization
 LABEL_SMOOTH = 0.1
@@ -264,6 +265,9 @@ def main():
         root=data_root, split="train", download=True,
         transform=train_transform, synthetic_root=syn_root
     )
+    print(f"📂 Loaded {len(train_ds.samples)} training images "
+      f"({len(train_ds.samples) - len(train_ds._image_files)} synthetic)")
+    
     val_ds = Food101(root=data_root, split="test", download=False, transform=val_transform)
 
     # Weighted sampler for balance on merged train set
