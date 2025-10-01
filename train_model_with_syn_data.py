@@ -233,6 +233,8 @@ def main():
     parser.add_argument("--mixup", action="store_true", help="Enable MixUp regularization")
     parser.add_argument("--alpha", default=0.2, type=float, help="MixUp alpha")
     parser.add_argument("--no-resume", action="store_true", help="Do not auto-resume even if a checkpoint exists")
+    parser.add_argument("--fresh", action="store_true", help="Start training from scratch (ignore checkpoints)")  # <── NEW
+
     args = parser.parse_args()
 
     data_root = args.data_root
@@ -253,6 +255,7 @@ def main():
         transforms.ColorJitter(brightness=0.25, contrast=0.25, saturation=0.2),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), value="random"),
     ])
     val_transform = transforms.Compose([
         transforms.Resize((args.img_size, args.img_size)),
@@ -303,10 +306,11 @@ def main():
 
     # Auto-resume
     start_epoch, best_val = 0, 0.0
-    if (not args.no_resume) and os.path.exists(last_path):
+    if (not args.no_resume) and (not args.fresh) and os.path.exists(last_path):
         print("🔁 Auto-resume: loading last checkpoint…")
         start_epoch, best_val, prev_args = load_checkpoint(last_path, model, optimizer, scheduler)
         print(f"✅ Resumed from epoch {start_epoch} (best_val={best_val:.2f}%)")
+
         # Optional: warn if major hyperparams changed since last run
         if prev_args:
             changed = []
@@ -316,6 +320,9 @@ def main():
                     changed.append(f"{k}: {old} -> {new}")
             if changed:
                 print("⚠️ Hyperparameters changed since checkpoint:", "; ".join(changed))
+    elif args.fresh:
+        print("🆕 Fresh training requested → ignoring checkpoints, starting from epoch 0.")
+
     # Early stopping setup
     patience = 5  # stop after N epochs with no val improvement
     patience_counter = 0
