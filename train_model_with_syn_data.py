@@ -329,18 +329,23 @@ def main():
     early_stop_triggered = False
     # Train loop
     for epoch in range(start_epoch, args.epochs):
-        if epoch < int(0.6 * args.epochs):        # strong MixUp
+        if epoch < 1:  # 🔥 warm-up (first epoch clean)
+            current_mixup = False
+            current_alpha = 0.0
+            use_erasing = False
+        elif epoch < int(0.6 * args.epochs):        # strong MixUp
             current_mixup = True
             current_alpha = 0.2
             use_erasing = False
-        elif epoch < int(0.8 * args.epochs):      # weaker MixUp + enable RandomErasing
+        elif epoch < int(0.8 * args.epochs):        # weaker MixUp + enable RandomErasing
             current_mixup = True
             current_alpha = 0.1
             use_erasing = True
-        else:                                     # final fine-tune phase
+        else:                                       # final fine-tune phase
             current_mixup = False
             current_alpha = 0.0
             use_erasing = True
+
 
         # Dynamically update RandomErasing transform
         if use_erasing:
@@ -360,14 +365,14 @@ def main():
         
         model.train()
         run_loss, correct, total = 0.0, 0, 0
-        print(f"\n🔁 Epoch {epoch+1}/{args.epochs}  |  MixUp={'ON' if args.mixup else 'OFF'} (alpha={args.alpha if args.mixup else 0})")
+        # print(f"\n🔁 Epoch {epoch+1}/{args.epochs}  |  MixUp={'ON' if args.mixup else 'OFF'} (alpha={args.alpha if args.mixup else 0})")
 
         for images, labels in tqdm(train_loader, desc="Training"):
             images, labels = images.to(DEVICE), labels.to(DEVICE)
 
             # MixUp (only if enabled)
-            if args.mixup:
-                inputs, (y_a, y_b), lam = mixup_batch(images, labels, args.alpha)
+            if current_mixup and current_alpha > 0:
+                inputs, (y_a, y_b), lam = mixup_batch(images, labels, current_alpha)
             else:
                 inputs, (y_a, y_b), lam = images, (labels, labels), 1.0
 
