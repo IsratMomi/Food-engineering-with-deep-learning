@@ -329,6 +329,35 @@ def main():
     early_stop_triggered = False
     # Train loop
     for epoch in range(start_epoch, args.epochs):
+        if epoch < int(0.6 * args.epochs):        # strong MixUp
+            current_mixup = True
+            current_alpha = 0.2
+            use_erasing = False
+        elif epoch < int(0.8 * args.epochs):      # weaker MixUp + enable RandomErasing
+            current_mixup = True
+            current_alpha = 0.1
+            use_erasing = True
+        else:                                     # final fine-tune phase
+            current_mixup = False
+            current_alpha = 0.0
+            use_erasing = True
+
+        # Dynamically update RandomErasing transform
+        if use_erasing:
+            if not any(isinstance(t, transforms.RandomErasing) for t in train_loader.dataset.transform.transforms):
+                train_loader.dataset.transform.transforms.append(
+                    transforms.RandomErasing(p=0.25, scale=(0.02, 0.33), ratio=(0.3, 3.3))
+                )
+        else:
+            train_loader.dataset.transform.transforms = [
+                t for t in train_loader.dataset.transform.transforms
+                if not isinstance(t, transforms.RandomErasing)
+            ]
+
+        print(f"\n🔁 Epoch {epoch+1}/{args.epochs}  |  "
+            f"MixUp={'ON' if current_mixup else 'OFF'} (alpha={current_alpha})  "
+            f"| RandomErasing={'ON' if use_erasing else 'OFF'}")
+        
         model.train()
         run_loss, correct, total = 0.0, 0, 0
         print(f"\n🔁 Epoch {epoch+1}/{args.epochs}  |  MixUp={'ON' if args.mixup else 'OFF'} (alpha={args.alpha if args.mixup else 0})")
