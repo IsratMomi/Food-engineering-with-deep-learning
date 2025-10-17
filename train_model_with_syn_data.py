@@ -17,9 +17,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.optim.lr_scheduler import SequentialLR, LinearLR
 from torchvision import models, transforms
 from torchvision.datasets import Food101
 from tqdm import tqdm
+from copy import deepcopy
 from top_confusion_matrix import plot_top_confusions
 
 import cv2
@@ -155,14 +157,27 @@ def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float) -> tuple:
     y_a, y_b = y, y[index]
     return mixed_x, (y_a, y_b), lam
 
+def cutmix_batch(x, y, alpha=1.0):
+    lam = np.random.beta(alpha, alpha)
+    batch_size, _, H, W = x.size()
+    rand_index = torch.randperm(batch_size)
+    cx, cy = np.random.randint(W), np.random.randint(H)
+    w = int(W * np.sqrt(1 - lam))
+    h = int(H * np.sqrt(1 - lam))
+    x1, y1, x2, y2 = np.clip(cx - w // 2, 0, W), np.clip(cy - h // 2, 0, H), np.clip(cx + w // 2, 0, W), np.clip(cy + h // 2, 0, H)
+    x[:, :, y1:y2, x1:x2] = x[rand_index, :, y1:y2, x1:x2]
+    lam = 1 - ((x2 - x1) * (y2 - y1) / (W * H))
+    return x, (y, y[rand_index]), lam
+
 
 # ----------------------------
 # Checkpoint utils (with RNG states)
 # ----------------------------
-def save_checkpoint(path, epoch, model, optimizer, scheduler, best_val, args):
+def save_checkpoint(path, epoch, model, ema_model, optimizer, scheduler, best_val, args):
     state = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
+        "ema_state_dict": ema_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "best_val": best_val,
@@ -298,11 +313,33 @@ def main():
     model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
     model.fc = nn.Linear(model.fc.in_features, 101)
     model = model.to(DEVICE)
+    ema_decay = 0.999
+    ema_model = deepcopy(model)
+    for p in ema_model.parameters():
+        p.requires_grad_(False)
 
     # Loss / Optimizer / Scheduler
     criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    
+    warmup_epochs = max(1, int(0.05 * args.epochs))       # 5% warm-up
+    main_epochs   = args.epochs - warmup_epochs
+    cosine_epochs = int(0.9 * main_epochs)
+    cooldown_epochs = args.epochs - cosine_epochs - warmup_epochs
+
+    scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cosine_epochs)
+    scheduler_cooldown = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cooldown_epochs, eta_min=1e-6)
+
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[
+            LinearLR(optimizer, start_factor=0.3, total_iters=warmup_epochs),
+            scheduler_cosine,
+            scheduler_cooldown,
+        ],
+        milestones=[warmup_epochs, warmup_epochs + cosine_epochs],
+    )
 
     # Auto-resume
     start_epoch, best_val = 0, 0.0
@@ -310,6 +347,15 @@ def main():
         print("🔁 Auto-resume: loading last checkpoint…")
         start_epoch, best_val, prev_args = load_checkpoint(last_path, model, optimizer, scheduler)
         print(f"✅ Resumed from epoch {start_epoch} (best_val={best_val:.2f}%)")
+        
+        # --- Restore EMA model if available ---
+        try:
+            ckpt = torch.load(last_path, map_location=DEVICE, weights_only=False)
+            if "ema_state_dict" in ckpt and ckpt["ema_state_dict"] is not None:
+                ema_model.load_state_dict(ckpt["ema_state_dict"])
+                print("✅ EMA model restored from checkpoint.")
+        except Exception as e:
+            print(f"⚠️ EMA restore failed: {e}")
 
         # Optional: warn if major hyperparams changed since last run
         if prev_args:
@@ -363,6 +409,11 @@ def main():
             f"MixUp={'ON' if current_mixup else 'OFF'} (alpha={current_alpha})  "
             f"| RandomErasing={'ON' if use_erasing else 'OFF'}")
         
+        if current_mixup:
+            criterion.label_smoothing = 0.15
+        else:
+            criterion.label_smoothing = 0.05
+        
         model.train()
         run_loss, correct, total = 0.0, 0, 0
         # print(f"\n🔁 Epoch {epoch+1}/{args.epochs}  |  MixUp={'ON' if args.mixup else 'OFF'} (alpha={args.alpha if args.mixup else 0})")
@@ -371,16 +422,30 @@ def main():
             images, labels = images.to(DEVICE), labels.to(DEVICE)
 
             # MixUp (only if enabled)
+            # if current_mixup and current_alpha > 0:
+            #     inputs, (y_a, y_b), lam = mixup_batch(images, labels, current_alpha)
+            # else:
+            #     inputs, (y_a, y_b), lam = images, (labels, labels), 1.0
+            
+            use_cutmix = random.random() < 0.5
             if current_mixup and current_alpha > 0:
-                inputs, (y_a, y_b), lam = mixup_batch(images, labels, current_alpha)
+                inputs, (y_a, y_b), lam = (cutmix_batch if use_cutmix else mixup_batch)(images, labels, current_alpha)
             else:
-                inputs, (y_a, y_b), lam = images, (labels, labels), 1.0
+                inputs, y_a, y_b, lam = images, labels, labels, 1.0
+
 
             optimizer.zero_grad()
             outputs = model(inputs)
             loss = lam * criterion(outputs, y_a) + (1.0 - lam) * criterion(outputs, y_b)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
+            
+            # EMA update
+            with torch.no_grad():
+                for ema_p, p in zip(ema_model.parameters(), model.parameters()):
+                    ema_p.mul_(ema_decay).add_(p, alpha=1 - ema_decay)
+
 
             run_loss += loss.item()
             # Training accuracy with hard labels (interpretable; lower with MixUp by design)
@@ -392,34 +457,60 @@ def main():
         print(f"🟢 Train Loss: {run_loss:.4f} | Train Acc: {train_acc:.2f}%")
 
         # Validation
-        model.eval()
-        v_correct, v_total = 0, 0
+        # model.eval()
+        # v_correct, v_total = 0, 0
         y_true, y_pred = [], []   # collect for confusion matrix
-        with torch.no_grad():
-            for images, labels in tqdm(val_loader, desc="Validation"):
-                images, labels = images.to(DEVICE), labels.to(DEVICE)
-                outputs = model(images)
-                _, pred = outputs.max(1)
-                v_correct += pred.eq(labels).sum().item()
-                v_total += labels.size(0)
+        # with torch.no_grad():
+        #     for images, labels in tqdm(val_loader, desc="Validation"):
+        #         images, labels = images.to(DEVICE), labels.to(DEVICE)
+        #         outputs = model(images)
+        #         _, pred = outputs.max(1)
+        #         v_correct += pred.eq(labels).sum().item()
+        #         v_total += labels.size(0)
                 
-                # collect predictions & ground truth
-                y_true.extend(labels.cpu().numpy())
-                y_pred.extend(pred.cpu().numpy())
-        val_acc = 100.0 * v_correct / v_total if v_total else 0.0
-        print(f"🔵 Validation Accuracy: {val_acc:.2f}%")
+        #         # collect predictions & ground truth
+        #         y_true.extend(labels.cpu().numpy())
+        #         y_pred.extend(pred.cpu().numpy())
+        # val_acc = 100.0 * v_correct / v_total if v_total else 0.0
+        # print(f"🔵 Validation Accuracy: {val_acc:.2f}%")
+        
+        # EMA Evaluation
+        
+        for eval_model, tag in [(model, ""), (ema_model, " (EMA)")]:
+            eval_model.eval()
+            v_correct, v_total = 0, 0
+            with torch.no_grad():
+                for images, labels in tqdm(val_loader, desc=f"Validation{tag}"):
+                    outputs = eval_model(images.to(DEVICE))
+                    _, pred = outputs.max(1)
+                    v_correct += pred.eq(labels.to(DEVICE)).sum().item()
+                    v_total += labels.size(0)
+                    
+                    y_true.extend(labels.cpu().numpy())
+                    y_pred.extend(pred.cpu().numpy())
+            val_acc = 100.0 * v_correct / v_total
+            if tag:
+                print(f"🟣 EMA Validation Accuracy: {val_acc:.2f}%")
+
 
         # Step LR
         scheduler.step()
+        
+        cooldown_start = int(0.9 * args.epochs)
+        if epoch >= cooldown_start:
+            for param_group in optimizer.param_groups:
+                old_lr = param_group['lr']
+                param_group['lr'] = old_lr * 0.5
+            print(f"🧊 Cooldown active: LR reduced by 50% → current LR={optimizer.param_groups[0]['lr']:.6f}")
 
         # Save checkpoints (last & best) + append CSV log
-        save_checkpoint(last_path, epoch + 1, model, optimizer, scheduler, best_val, args)
+        save_checkpoint(last_path, epoch + 1, model, ema_model, optimizer, scheduler, best_val, args)
         print(f"💾 Last checkpoint saved → {last_path}")
 
         if val_acc > best_val:
             best_val = val_acc
             patience_counter = 0  # reset if improvement
-            save_checkpoint(best_path, epoch + 1, model, optimizer, scheduler, best_val, args)
+            save_checkpoint(best_path, epoch + 1, model, ema_model, optimizer, scheduler, best_val, args)
             print(f"🏅 New best ({best_val:.2f}%) → {best_path}")
         else:
             patience_counter += 1
