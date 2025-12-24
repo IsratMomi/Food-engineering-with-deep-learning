@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, WeightedRandomSampler, Dataset, ConcatDataset
+from torch.utils.data import DataLoader, WeightedRandomSampler, Dataset
 from torch.optim.lr_scheduler import SequentialLR, LinearLR
 from torchvision import models, transforms
 from torchvision.datasets import Food101
@@ -30,16 +30,16 @@ cv2.setNumThreads(0)
 DEVICE = torch.device("cpu")
 
 # Adjust these paths for your environment
-DEFAULT_DATA_ROOT = r"E:\er\project-food\data"  # contains food-101/
-DEFAULT_FOOD_ROOT = os.path.join(DEFAULT_DATA_ROOT, "food-101")
+DEFAULT_DATA_ROOT = r"E:\er\project-food\data"  # Food101 root must be THIS (contains food-101/ folder)
 DEFAULT_SYNTH_ROOT = os.path.join(DEFAULT_DATA_ROOT, "synthetic_data")
-
 DEFAULT_BANGLA_ROOT = r"E:\er\project-food\data\bangla-food"  # has train/ and test/
 
 DEFAULT_CKPT_DIR = "./checkpoints_cv_food_bangla"
 DEFAULT_LOG = "training_log_all_folds.csv"
 DEFAULT_SUMMARY = "training_summary.txt"
-ENSEMBLE_CKPT = "resnet50_food101_ensemble.pth"
+
+# We will NOT do weight-averaging ensemble (requirement: average probabilities)
+ENSEMBLE_INFO = "food101_5fold_ensemble_info.txt"
 FINAL_120_CKPT = "resnet50_food101_bangla_120.pth"
 
 DEFAULT_BATCH_SIZE = 16
@@ -50,8 +50,14 @@ NUM_WORKERS = 0
 
 APPLY_CLAHE = True
 APPLY_POSTPROCESS = True
-LABEL_SMOOTH = 0.1
-MIXUP_ALPHA_BASE = 0.2
+
+# Your requested changes:
+# - MixUp/CutMix alpha = 0.1 and OFF after epoch 15
+# - Label smoothing = 0.05 (0.1 only during mixup)
+MIXUP_ALPHA_BASE = 0.1
+MIXUP_OFF_AFTER_EPOCH = 15  # 1-based epoch number
+LABEL_SMOOTH_NO_MIX = 0.05
+LABEL_SMOOTH_MIX = 0.10
 
 N_FOLDS = 5
 SEED = 42
@@ -86,12 +92,13 @@ class SimpleImageDataset(Dataset):
     Dataset from explicit list of (abs_path, label).
     Can optionally apply CLAHE + postprocess before transforms.
     """
-
-    def __init__(self,
-                 samples: List[Tuple[str, int]],
-                 transform=None,
-                 apply_clahe: bool = False,
-                 apply_postprocess: bool = False):
+    def __init__(
+        self,
+        samples: List[Tuple[str, int]],
+        transform=None,
+        apply_clahe: bool = False,
+        apply_postprocess: bool = False,
+    ):
         self.samples = samples
         self.transform = transform
         self.apply_clahe = apply_clahe
@@ -104,7 +111,6 @@ class SimpleImageDataset(Dataset):
         path, label = self.samples[idx]
         img = cv2.imread(path)
         if img is None or img.size == 0:
-            # fall back to next sample if corrupted
             return self.__getitem__((idx + 1) % len(self.samples))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
@@ -226,21 +232,30 @@ def append_global_log(path, fold, epoch, train_loss, train_acc, val_acc,
 # TRAIN / VAL LOOP
 # ------------------------------------------------------------------
 def train_one_epoch(model, train_loader, optimizer, criterion,
-                    epoch, total_epochs, mixup_base_alpha, device):
-    # Epoch-wise schedule
-    if epoch < 1:
-        current_mixup, current_alpha, use_erasing = False, 0.0, False
-    elif epoch < int(0.6 * total_epochs):
-        current_mixup, current_alpha, use_erasing = True, mixup_base_alpha, False
-    elif epoch < int(0.8 * total_epochs):
-        current_mixup, current_alpha, use_erasing = True, mixup_base_alpha / 2.0, True
-    else:
-        current_mixup, current_alpha, use_erasing = False, 0.0, True
+                    epoch, total_epochs, mixup_alpha, device):
+    """
+    Changes applied:
+      - MixUp/CutMix alpha fixed at 0.1
+      - MixUp/CutMix OFF after epoch 15 (1-based)
+      - Label smoothing: 0.1 during mixup, else 0.05
+    NOTE: We keep your existing RandomErasing toggle logic (not part of the 4 required changes).
+    """
+    epoch_1based = epoch + 1
 
-    # Adjust RandomErasing in transform (if present)
+    # MixUp schedule requested
+    if epoch_1based <= 1:
+        current_mixup, current_alpha = False, 0.0
+        use_erasing = False
+    elif epoch_1based <= MIXUP_OFF_AFTER_EPOCH:
+        current_mixup, current_alpha = True, mixup_alpha
+        use_erasing = False
+    else:
+        current_mixup, current_alpha = False, 0.0
+        use_erasing = True
+
+    # RandomErasing toggle (kept)
     if hasattr(train_loader.dataset, "transform") and train_loader.dataset.transform is not None:
         tforms = train_loader.dataset.transform.transforms
-        # remove existing RandomErasing
         tforms = [t for t in tforms if not isinstance(t, transforms.RandomErasing)]
         if use_erasing:
             tforms.append(
@@ -250,9 +265,9 @@ def train_one_epoch(model, train_loader, optimizer, criterion,
             )
         train_loader.dataset.transform.transforms = tforms
 
-    # Label smoothing schedule
+    # Label smoothing schedule requested
     if isinstance(criterion, nn.CrossEntropyLoss):
-        criterion.label_smoothing = 0.15 if current_mixup else 0.05
+        criterion.label_smoothing = LABEL_SMOOTH_MIX if current_mixup else LABEL_SMOOTH_NO_MIX
 
     model.train()
     run_loss, correct, total = 0.0, 0, 0
@@ -302,20 +317,58 @@ def eval_model(model, val_loader, device):
     return acc, y_true, y_pred
 
 
+def ensemble_predict_proba(ckpt_paths: List[str], loader: DataLoader, num_classes: int, device):
+    """
+    Requirement: Ensemble Method A = average probabilities across the 5 fold models.
+    We load each fold-best checkpoint, run forward, accumulate softmax probs, average.
+    Returns: (y_true, y_pred, probs_avg)
+    """
+    probs_sum = None
+    y_true_all = None
+
+    for i, p in enumerate(ckpt_paths, start=1):
+        model = build_resnet(num_classes).to(device)
+        load_checkpoint(p, model)
+        model.eval()
+
+        fold_probs = []
+        fold_true = []
+
+        with torch.no_grad():
+            for images, labels in tqdm(loader, desc=f"Ensemble fold {i}/{len(ckpt_paths)}", leave=False):
+                images = images.to(device)
+                outputs = model(images)
+                probs = torch.softmax(outputs, dim=1).cpu().numpy()
+                fold_probs.append(probs)
+                fold_true.extend(labels.numpy().tolist())
+
+        fold_probs = np.concatenate(fold_probs, axis=0)
+
+        if probs_sum is None:
+            probs_sum = fold_probs
+            y_true_all = fold_true
+        else:
+            probs_sum += fold_probs
+
+    probs_avg = probs_sum / float(len(ckpt_paths))
+    y_pred = np.argmax(probs_avg, axis=1).tolist()
+    return y_true_all, y_pred, probs_avg
+
+
 # ------------------------------------------------------------------
 # FOOD-101 DATA LOADING
 # ------------------------------------------------------------------
-def load_food101_train_samples(root: str):
-    ds = Food101(root=root, split="train", download=True)
+def load_food101_train_samples(food101_root: str):
+    """
+    IMPORTANT PATH FIX:
+    Food101(root=...) expects root that CONTAINS the 'food-101' folder.
+    So pass DEFAULT_DATA_ROOT (e.g. E:\\...\\data), NOT E:\\...\\data\\food-101
+    """
+    ds = Food101(root=food101_root, split="train", download=False)
     image_files = getattr(ds, "_image_files", None)
     labels = getattr(ds, "_labels", None)
     if image_files is None or labels is None:
-        # fallback: use __getitem__
-        image_files, labels = [], []
-        for idx in range(len(ds)):
-            img_path, target = ds._image_files[idx], ds._labels[idx]  # type: ignore
-            image_files.append(img_path)
-            labels.append(target)
+        raise RuntimeError("Food101 internals changed (_image_files/_labels not found).")
 
     samples = [(os.path.abspath(p), int(y)) for p, y in zip(image_files, labels)]
     classes = ds.classes
@@ -323,10 +376,12 @@ def load_food101_train_samples(root: str):
     return samples, labels, classes, class_to_idx
 
 
-def load_food101_test_samples(root: str):
-    ds = Food101(root=root, split="test", download=True)
+def load_food101_test_samples(food101_root: str):
+    ds = Food101(root=food101_root, split="test", download=False)
     image_files = getattr(ds, "_image_files", None)
     labels = getattr(ds, "_labels", None)
+    if image_files is None or labels is None:
+        raise RuntimeError("Food101 internals changed (_image_files/_labels not found).")
     samples = [(os.path.abspath(p), int(y)) for p, y in zip(image_files, labels)]
     return samples, labels
 
@@ -367,32 +422,11 @@ def collect_imagefolder_samples(root_dir: str, class_offset: int = 0):
 
 
 # ------------------------------------------------------------------
-# AVERAGE CHECKPOINTS (ENSEMBLE)
-# ------------------------------------------------------------------
-def average_checkpoints(ckpt_paths: List[str], num_classes: int):
-    model = build_resnet(num_classes)
-    state_dicts = []
-    for p in ckpt_paths:
-        ckpt = torch.load(p, map_location=DEVICE)
-        state_dicts.append(ckpt["model_state_dict"])
-
-    avg_sd = {}
-    keys = state_dicts[0].keys()
-    for k in keys:
-        tensors = [sd[k].float() for sd in state_dicts]
-        avg_sd[k] = sum(tensors) / float(len(tensors))
-
-    model.load_state_dict(avg_sd)
-    return model, avg_sd
-
-
-# ------------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", default=DEFAULT_DATA_ROOT, type=str)
-    parser.add_argument("--food-root", default=DEFAULT_FOOD_ROOT, type=str)
     parser.add_argument("--synthetic-root", default=DEFAULT_SYNTH_ROOT, type=str)
     parser.add_argument("--bangla-root", default=DEFAULT_BANGLA_ROOT, type=str)
     parser.add_argument("--ckpt-dir", default=DEFAULT_CKPT_DIR, type=str)
@@ -412,19 +446,19 @@ def main():
     # --------------------------------------------------------------
     print("📦 Loading Food-101 train samples...")
     food_train_samples, food_train_labels, food_classes, food_class_to_idx = \
-        load_food101_train_samples(args.food_root)
+        load_food101_train_samples(args.data_root)
     num_food_classes = len(food_classes)
     print(f"Food-101 train images: {len(food_train_samples)} | classes: {num_food_classes}")
 
     print("📦 Loading Food-101 test samples...")
-    food_test_samples, food_test_labels = load_food101_test_samples(args.food_root)
+    food_test_samples, food_test_labels = load_food101_test_samples(args.data_root)
     print(f"Food-101 test images: {len(food_test_samples)}")
 
     print("🧩 Loading synthetic samples...")
     synth_samples = load_synthetic_samples(args.synthetic_root, food_class_to_idx)
     print(f"Synthetic images found: {len(synth_samples)}")
 
-    # For dataloaders we need transforms
+    # transforms (input size already 256 as required)
     train_transform = transforms.Compose([
         transforms.Resize((args.img_size + 32, args.img_size + 32)),
         transforms.RandomResizedCrop(args.img_size, scale=(0.7, 1.0)),
@@ -458,14 +492,13 @@ def main():
         fold_best_path = os.path.join(fold_dir, f"resnet50_food101_fold{fold_idx}_best.pth")
         fold_last_path = os.path.join(fold_dir, f"resnet50_food101_fold{fold_idx}_last.pth")
 
-        # Build fold-specific samples
+        # fold-specific samples (synthetic inside each fold = YES)
         fold_train_samples = [food_train_samples[i] for i in train_idx] + synth_samples
         fold_train_labels = [food_train_labels[i] for i in train_idx] + \
                             [lbl for _, lbl in synth_samples]
         fold_val_samples = [food_train_samples[i] for i in val_idx]
         fold_val_labels = [food_train_labels[i] for i in val_idx]
 
-        # Datasets
         train_ds = SimpleImageDataset(
             fold_train_samples,
             transform=train_transform,
@@ -479,7 +512,6 @@ def main():
             apply_postprocess=False
         )
 
-        # Sampler for class balance
         class_counts = np.bincount(fold_train_labels, minlength=num_food_classes)
         class_weights = 1.0 / (class_counts + 1e-6)
         sample_weights = [float(class_weights[t]) for t in fold_train_labels]
@@ -506,9 +538,8 @@ def main():
         _ = next(iter(train_loader))
         print("✅ Fold dataloader warmup ok")
 
-        # Model / criterion / optimizer / scheduler
         model = build_resnet(num_food_classes).to(DEVICE)
-        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
+        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH_NO_MIX)
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
         warmup_epochs = max(1, int(0.05 * args.epochs))
@@ -540,15 +571,15 @@ def main():
                 model, train_loader, optimizer, criterion,
                 epoch, args.epochs, MIXUP_ALPHA_BASE, DEVICE
             )
-            val_acc, y_true_fold, y_pred_fold = eval_model(
-                model, val_loader, DEVICE
-            )
+            val_acc, y_true_fold, y_pred_fold = eval_model(model, val_loader, DEVICE)
             scheduler.step()
 
             lr_now = optimizer.param_groups[0]['lr']
-            print(f"   Train Loss={train_loss:.4f} | "
-                  f"Train Acc={train_acc:.2f}% | "
-                  f"Val Acc={val_acc:.2f}% | LR={lr_now:.6e}")
+            print(
+                f"   Train Loss={train_loss:.4f} | "
+                f"Train Acc={train_acc:.2f}% | "
+                f"Val Acc={val_acc:.2f}% | LR={lr_now:.6e}"
+            )
 
             append_global_log(
                 global_log_path, fold_idx, epoch + 1,
@@ -557,7 +588,6 @@ def main():
                 args.batch_size, lr_now, args.img_size
             )
 
-            # save last
             save_checkpoint(
                 fold_last_path, epoch + 1, model, optimizer, scheduler,
                 best_val, extra={"fold": fold_idx}
@@ -575,9 +605,8 @@ def main():
         fold_accuracies.append(best_val)
         best_ckpts.append(fold_best_path)
 
-        # Final confusion / top-10 pairs for this fold
+        # Confusion Matrix option B (top confusions) for fold validation
         try:
-            # ensure using best weights
             load_checkpoint(fold_best_path, model)
             val_acc_final, y_true_final, y_pred_final = eval_model(model, val_loader, DEVICE)
             cm = confusion_matrix(y_true_final, y_pred_final, labels=list(range(num_food_classes)))
@@ -588,33 +617,71 @@ def main():
             print(f"⚠️ Failed to save top confusion for fold {fold_idx}: {e}")
 
     # --------------------------------------------------------------
-    # 3) ENSEMBLE OVER FOLDS
+    # 3) ENSEMBLE OVER FOLDS (AVERAGE PROBABILITIES) + FOOD-101 TEST EVAL
     # --------------------------------------------------------------
-    print("\n==================== ENSEMBLE OVER FOLDS ====================")
-    ensemble_model, ensemble_sd = average_checkpoints(best_ckpts, num_food_classes)
-    ensemble_path = os.path.join(args.ckpt_dir, ENSEMBLE_CKPT)
-    torch.save(
-        {"model_state_dict": ensemble_sd, "fold_accuracies": fold_accuracies},
-        ensemble_path
+    print("\n==================== ENSEMBLE OVER FOLDS (avg probs) ====================")
+
+    food_test_ds = SimpleImageDataset(
+        food_test_samples,
+        transform=val_transform,
+        apply_clahe=False,
+        apply_postprocess=False
     )
-    print(f"💾 Saved ensemble Food-101 model → {ensemble_path}")
+    food_test_loader = DataLoader(
+        food_test_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=NUM_WORKERS
+    )
+
+    y_true_test, y_pred_test, _ = ensemble_predict_proba(
+        best_ckpts, food_test_loader, num_food_classes, DEVICE
+    )
+    test_acc = 100.0 * (np.array(y_true_test) == np.array(y_pred_test)).mean()
+    print(f"✅ Food-101 TEST accuracy (5-fold prob-ensemble): {test_acc:.2f}%")
+
+    # Confusion Matrix option B for ensemble on Food-101 test
+    try:
+        cm_test = confusion_matrix(y_true_test, y_pred_test, labels=list(range(num_food_classes)))
+        cm_path = os.path.join(args.ckpt_dir, "top10_confusions_ENSEMBLE_food101_test.png")
+        plot_top_confusions(cm_test, food_classes, top_k=10, out_path=cm_path)
+        print(f"📊 Saved top-10 confusion pairs for ENSEMBLE (Food101 test) → {cm_path}")
+    except Exception as e:
+        print(f"⚠️ Failed to save top confusion for ensemble: {e}")
 
     mean_acc = float(np.mean(fold_accuracies))
     std_acc = float(np.std(fold_accuracies))
-    print(f"Fold accuracies: {fold_accuracies}")
-    print(f"Mean acc: {mean_acc:.2f}% | Std: {std_acc:.2f}%")
+    print(f"Fold best val accuracies: {fold_accuracies}")
+    print(f"Mean val acc: {mean_acc:.2f}% | Std: {std_acc:.2f}%")
+
+    # Save ensemble info (since we don't average weights)
+    ensemble_info_path = os.path.join(args.ckpt_dir, ENSEMBLE_INFO)
+    with open(ensemble_info_path, "w", encoding="utf-8") as f:
+        f.write("Food-101 5-Fold Ensemble (Average Probabilities)\n")
+        f.write("==============================================\n")
+        for i, p in enumerate(best_ckpts, start=1):
+            f.write(f"Fold {i} best: {p}\n")
+        f.write("\nFold best val accuracies:\n")
+        for i, a in enumerate(fold_accuracies, start=1):
+            f.write(f"  Fold {i}: {a:.2f}%\n")
+        f.write(f"\nMean val acc: {mean_acc:.2f}%\nStd val acc : {std_acc:.2f}%\n")
+        f.write(f"\nFood-101 test acc (ensemble): {test_acc:.2f}%\n")
+    print(f"📝 Saved ensemble info → {ensemble_info_path}")
 
     # --------------------------------------------------------------
     # 4) B A N G L A   +  G L O B A L   F I N E - T U N E
     #    (No k-fold here, as requested)
+    #
+    # NOTE: To initialize a single 120-class model, we must pick ONE set of weights.
+    # We pick the BEST fold checkpoint (highest fold best val), then expand to 120.
+    # Ensemble remains used for evaluation (avg probabilities) on Food-101.
     # --------------------------------------------------------------
     print("\n==================== B A N G L A  S T A G E ====================")
     bangla_train_root = os.path.join(args.bangla_root, "train")
     bangla_test_root = os.path.join(args.bangla_root, "test")
 
     if not (os.path.isdir(bangla_train_root) and os.path.isdir(bangla_test_root)):
-        print(f"⚠️ Bangla root {args.bangla_root} missing train/ or test/. "
-              f"Skipping Bangla integration.")
+        print(f"⚠️ Bangla root {args.bangla_root} missing train/ or test/. Skipping Bangla integration.")
     else:
         bangla_train_samples, bangla_classes, _ = collect_imagefolder_samples(
             bangla_train_root, class_offset=num_food_classes
@@ -629,20 +696,29 @@ def main():
               f"Bangla test images: {len(bangla_test_samples)} | "
               f"Bangla classes: {num_bangla}")
 
-        # Build 120-class model by expanding ensemble model
+        # Pick best fold model to initialize (single-model requirement for 120-class training)
+        best_fold_idx = int(np.argmax(fold_accuracies))
+        best_fold_ckpt = best_ckpts[best_fold_idx]
+        print(f"🏁 Using fold-{best_fold_idx + 1} best checkpoint for 120-class init: {best_fold_ckpt}")
+
+        # Load 101-class weights from best fold
+        base_101 = build_resnet(num_food_classes).to(DEVICE)
+        load_checkpoint(best_fold_ckpt, base_101)
+        base_sd = base_101.state_dict()
+
+        # Build 120-class model and copy backbone + first 101 FC rows
         model_120 = build_resnet(num_total_classes).to(DEVICE)
-        # Copy backbone + first 101 fc rows
         sd_120 = model_120.state_dict()
-        for k, v in ensemble_sd.items():
+
+        for k, v in base_sd.items():
             if k.startswith("fc."):
                 continue
             if k in sd_120 and sd_120[k].shape == v.shape:
                 sd_120[k].copy_(v)
-        # FC: copy first 101 rows from ensemble
-        fc_weight_old = ensemble_sd["fc.weight"]
-        fc_bias_old = ensemble_sd["fc.bias"]
-        sd_120["fc.weight"][:num_food_classes].copy_(fc_weight_old)
-        sd_120["fc.bias"][:num_food_classes].copy_(fc_bias_old)
+
+        # copy fc rows for first 101 classes
+        sd_120["fc.weight"][:num_food_classes].copy_(base_sd["fc.weight"])
+        sd_120["fc.bias"][:num_food_classes].copy_(base_sd["fc.bias"])
         model_120.load_state_dict(sd_120)
 
         # Merged train = Food-101 train + synthetic + Bangla train
@@ -651,14 +727,18 @@ def main():
                               [lbl for _, lbl in synth_samples] + \
                               [lbl for _, lbl in bangla_train_samples]
 
-        # Validation sets: Food-101 test + Bangla test (will evaluate separately)
-        food_test_ds = SimpleImageDataset(
-            food_test_samples, transform=val_transform,
-            apply_clahe=False, apply_postprocess=False
+        # Validation sets: Food-101 test + Bangla test (evaluate separately)
+        food_test_ds_120 = SimpleImageDataset(
+            food_test_samples,
+            transform=val_transform,
+            apply_clahe=False,
+            apply_postprocess=False
         )
         bangla_test_ds = SimpleImageDataset(
-            bangla_test_samples, transform=val_transform,
-            apply_clahe=False, apply_postprocess=False
+            bangla_test_samples,
+            transform=val_transform,
+            apply_clahe=False,
+            apply_postprocess=False
         )
 
         merged_train_ds = SimpleImageDataset(
@@ -668,7 +748,6 @@ def main():
             apply_postprocess=APPLY_POSTPROCESS
         )
 
-        # Sampler
         merged_counts = np.bincount(merged_train_labels, minlength=num_total_classes)
         merged_weights = 1.0 / (merged_counts + 1e-6)
         merged_sample_weights = [float(merged_weights[t]) for t in merged_train_labels]
@@ -684,8 +763,8 @@ def main():
             sampler=merged_sampler,
             num_workers=NUM_WORKERS
         )
-        food_test_loader = DataLoader(
-            food_test_ds,
+        food_test_loader_120 = DataLoader(
+            food_test_ds_120,
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=NUM_WORKERS
@@ -697,8 +776,8 @@ def main():
             num_workers=NUM_WORKERS
         )
 
-        # Global fine-tune with small LR
-        criterion_global = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
+        # Global fine-tune with small LR (kept)
+        criterion_global = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH_NO_MIX)
         optimizer_global = optim.Adam(model_120.parameters(), lr=args.lr / 10.0)
 
         warmup_g = max(1, int(0.1 * args.epochs))
@@ -733,14 +812,16 @@ def main():
                 MIXUP_ALPHA_BASE, DEVICE
             )
 
-            food_acc, _, _ = eval_model(model_120, food_test_loader, DEVICE)
+            food_acc, _, _ = eval_model(model_120, food_test_loader_120, DEVICE)
             bangla_acc, _, _ = eval_model(model_120, bangla_test_loader, DEVICE)
             scheduler_global.step()
 
             lr_g = optimizer_global.param_groups[0]['lr']
-            print(f"   Train Loss={g_train_loss:.4f} | Train Acc={g_train_acc:.2f}% "
-                  f"| Food101 Test Acc={food_acc:.2f}% "
-                  f"| Bangla Test Acc={bangla_acc:.2f}% | LR={lr_g:.6e}")
+            print(
+                f"   Train Loss={g_train_loss:.4f} | Train Acc={g_train_acc:.2f}% "
+                f"| Food101 Test Acc={food_acc:.2f}% "
+                f"| Bangla Test Acc={bangla_acc:.2f}% | LR={lr_g:.6e}"
+            )
 
             if food_acc > best_global_food:
                 best_global_food = food_acc
@@ -749,29 +830,34 @@ def main():
 
         final_120_path = os.path.join(args.ckpt_dir, FINAL_120_CKPT)
         torch.save(
-            {"model_state_dict": model_120.state_dict(),
-             "best_food_acc": best_global_food,
-             "best_bangla_acc": best_global_bangla,
-             "num_food_classes": num_food_classes,
-             "num_bangla_classes": num_bangla},
+            {
+                "model_state_dict": model_120.state_dict(),
+                "best_food_acc": best_global_food,
+                "best_bangla_acc": best_global_bangla,
+                "num_food_classes": num_food_classes,
+                "num_bangla_classes": num_bangla,
+                "init_from_fold": best_fold_idx + 1,
+                "init_ckpt": best_fold_ckpt,
+            },
             final_120_path
         )
         print(f"💾 Saved final 120-class Food+Bangla model → {final_120_path}")
-        print(f"Best Food-101 test acc: {best_global_food:.2f}%")
-        print(f"Best Bangla test acc: {best_global_bangla:.2f}%")
+        print(f"Best Food-101 test acc (single 120 model): {best_global_food:.2f}%")
+        print(f"Best Bangla test acc (single 120 model): {best_global_bangla:.2f}%")
 
     # --------------------------------------------------------------
     # 5) SUMMARY REPORT
     # --------------------------------------------------------------
     summary_path = os.path.join(args.ckpt_dir, DEFAULT_SUMMARY)
-    with open(summary_path, "w") as f:
+    with open(summary_path, "w", encoding="utf-8") as f:
         f.write("Food-101 5-Fold CV Results\n")
         f.write("===========================\n")
         for i, acc in enumerate(fold_accuracies, start=1):
             f.write(f"Fold {i}: {acc:.2f}%\n")
-        f.write(f"\nMean accuracy: {mean_acc:.2f}%\n")
-        f.write(f"Std accuracy : {std_acc:.2f}%\n")
-        f.write(f"\nEnsemble checkpoint: {ensemble_path}\n")
+        f.write(f"\nMean val accuracy: {mean_acc:.2f}%\n")
+        f.write(f"Std val accuracy : {std_acc:.2f}%\n")
+        f.write(f"\nFood-101 test accuracy (5-fold prob ensemble): {test_acc:.2f}%\n")
+        f.write(f"\nEnsemble info file: {ensemble_info_path}\n")
         f.write(f"Global ckpt dir: {args.ckpt_dir}\n")
 
     print(f"\n📝 Summary report written to: {summary_path}")
