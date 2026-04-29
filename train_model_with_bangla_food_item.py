@@ -183,20 +183,44 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, best_val, extra: d
 
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None):
-    ckpt = torch.load(path, map_location=DEVICE)
-    model.load_state_dict(ckpt["model_state_dict"])
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+    ckpt = torch.load(
+        path,
+        map_location=DEVICE,
+        weights_only=False   # Required for PyTorch >= 2.6
+    )
+
+    # ---- Model ----
+    if "model_state_dict" in ckpt:
+        model.load_state_dict(ckpt["model_state_dict"])
+    else:
+        raise KeyError("model_state_dict missing in checkpoint")
+
+    # ---- Optimizer ----
     if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+
+    # ---- Scheduler ----
     if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+
+    # ---- RNG states (for reproducibility) ----
     if "rng_torch" in ckpt:
         torch.set_rng_state(ckpt["rng_torch"])
+
     if "rng_numpy" in ckpt:
         np.random.set_state(ckpt["rng_numpy"])
+
     if "rng_python" in ckpt:
         random.setstate(ckpt["rng_python"])
-    return ckpt.get("epoch", 0), ckpt.get("best_val", 0.0), ckpt.get("extra", {})
 
+    return (
+        ckpt.get("epoch", 0),
+        ckpt.get("best_val", 0.0),
+        ckpt.get("extra", {})
+    )
 
 # ------------------------------------------------------------------
 # CSV LOGGING
@@ -435,6 +459,7 @@ def main():
     parser.add_argument("--img-size", default=DEFAULT_IMG_SIZE, type=int)
     parser.add_argument("--lr", default=DEFAULT_LR, type=float)
     parser.add_argument("--folds", default=N_FOLDS, type=int)
+    parser.add_argument("--eval-only", action="store_true")
     args = parser.parse_args()
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -483,138 +508,174 @@ def main():
     fold_accuracies = []
     best_ckpts = []
 
-    for fold_idx, (train_idx, val_idx) in enumerate(
+    if not args.eval_only:
+        for fold_idx, (train_idx, val_idx) in enumerate(
             skf.split(food_train_samples, food_train_labels), start=1):
 
-        print(f"\n==================== FOLD {fold_idx}/{args.folds} ====================")
-        fold_dir = os.path.join(args.ckpt_dir, f"fold_{fold_idx}")
-        os.makedirs(fold_dir, exist_ok=True)
-        fold_best_path = os.path.join(fold_dir, f"resnet50_food101_fold{fold_idx}_best.pth")
-        fold_last_path = os.path.join(fold_dir, f"resnet50_food101_fold{fold_idx}_last.pth")
+            print(f"\n==================== FOLD {fold_idx}/{args.folds} ====================")
+            fold_dir = os.path.join(args.ckpt_dir, f"fold_{fold_idx}")
+            os.makedirs(fold_dir, exist_ok=True)
+            fold_best_path = os.path.join(fold_dir, f"resnet50_food101_fold{fold_idx}_best.pth")
+            fold_last_path = os.path.join(fold_dir, f"resnet50_food101_fold{fold_idx}_last.pth")
 
-        # fold-specific samples (synthetic inside each fold = YES)
-        fold_train_samples = [food_train_samples[i] for i in train_idx] + synth_samples
-        fold_train_labels = [food_train_labels[i] for i in train_idx] + \
-                            [lbl for _, lbl in synth_samples]
-        fold_val_samples = [food_train_samples[i] for i in val_idx]
-        fold_val_labels = [food_train_labels[i] for i in val_idx]
+            # fold-specific samples (synthetic inside each fold = YES)
+            fold_train_samples = [food_train_samples[i] for i in train_idx] + synth_samples
+            fold_train_labels = [food_train_labels[i] for i in train_idx] + \
+                                [lbl for _, lbl in synth_samples]
+            fold_val_samples = [food_train_samples[i] for i in val_idx]
+            fold_val_labels = [food_train_labels[i] for i in val_idx]
 
-        train_ds = SimpleImageDataset(
-            fold_train_samples,
-            transform=train_transform,
-            apply_clahe=APPLY_CLAHE,
-            apply_postprocess=APPLY_POSTPROCESS
-        )
-        val_ds = SimpleImageDataset(
-            fold_val_samples,
-            transform=val_transform,
-            apply_clahe=False,
-            apply_postprocess=False
-        )
-
-        class_counts = np.bincount(fold_train_labels, minlength=num_food_classes)
-        class_weights = 1.0 / (class_counts + 1e-6)
-        sample_weights = [float(class_weights[t]) for t in fold_train_labels]
-        sampler = WeightedRandomSampler(
-            sample_weights,
-            num_samples=len(sample_weights),
-            replacement=True
-        )
-
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=args.batch_size,
-            sampler=sampler,
-            num_workers=NUM_WORKERS
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=NUM_WORKERS
-        )
-
-        print("🔎 Dataloader warmup for this fold…")
-        _ = next(iter(train_loader))
-        print("✅ Fold dataloader warmup ok")
-
-        model = build_resnet(num_food_classes).to(DEVICE)
-        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH_NO_MIX)
-        optimizer = optim.Adam(model.parameters(), lr=args.lr)
-
-        warmup_epochs = max(1, int(0.05 * args.epochs))
-        main_epochs = args.epochs - warmup_epochs
-        cosine_epochs = int(0.9 * main_epochs)
-        cooldown_epochs = args.epochs - cosine_epochs - warmup_epochs
-
-        scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(1, cosine_epochs)
-        )
-        scheduler_cooldown = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(1, cooldown_epochs), eta_min=1e-6
-        )
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[
-                LinearLR(optimizer, start_factor=0.3, total_iters=warmup_epochs),
-                scheduler_cosine,
-                scheduler_cooldown,
-            ],
-            milestones=[warmup_epochs, warmup_epochs + cosine_epochs],
-        )
-
-        best_val = 0.0
-
-        for epoch in range(args.epochs):
-            print(f"\n[Fold {fold_idx}] Epoch {epoch + 1}/{args.epochs}")
-            train_loss, train_acc, mixup_on, cur_alpha = train_one_epoch(
-                model, train_loader, optimizer, criterion,
-                epoch, args.epochs, MIXUP_ALPHA_BASE, DEVICE
+            train_ds = SimpleImageDataset(
+                fold_train_samples,
+                transform=train_transform,
+                apply_clahe=APPLY_CLAHE,
+                apply_postprocess=APPLY_POSTPROCESS
             )
-            val_acc, y_true_fold, y_pred_fold = eval_model(model, val_loader, DEVICE)
-            scheduler.step()
-
-            lr_now = optimizer.param_groups[0]['lr']
-            print(
-                f"   Train Loss={train_loss:.4f} | "
-                f"Train Acc={train_acc:.2f}% | "
-                f"Val Acc={val_acc:.2f}% | LR={lr_now:.6e}"
+            val_ds = SimpleImageDataset(
+                fold_val_samples,
+                transform=val_transform,
+                apply_clahe=False,
+                apply_postprocess=False
             )
 
-            append_global_log(
-                global_log_path, fold_idx, epoch + 1,
-                train_loss, train_acc, val_acc,
-                best_val, mixup_on, cur_alpha,
-                args.batch_size, lr_now, args.img_size
+            class_counts = np.bincount(fold_train_labels, minlength=num_food_classes)
+            class_weights = 1.0 / (class_counts + 1e-6)
+            sample_weights = [float(class_weights[t]) for t in fold_train_labels]
+            sampler = WeightedRandomSampler(
+                sample_weights,
+                num_samples=len(sample_weights),
+                replacement=True
             )
 
-            save_checkpoint(
-                fold_last_path, epoch + 1, model, optimizer, scheduler,
-                best_val, extra={"fold": fold_idx}
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=args.batch_size,
+                sampler=sampler,
+                num_workers=NUM_WORKERS
+            )
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=NUM_WORKERS
             )
 
-            if val_acc > best_val:
-                best_val = val_acc
+            print("🔎 Dataloader warmup for this fold…")
+            _ = next(iter(train_loader))
+            print("✅ Fold dataloader warmup ok")
+
+            model = build_resnet(num_food_classes).to(DEVICE)
+            criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH_NO_MIX)
+            optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+            warmup_epochs = max(1, int(0.05 * args.epochs))
+            main_epochs = args.epochs - warmup_epochs
+            cosine_epochs = int(0.9 * main_epochs)
+            cooldown_epochs = args.epochs - cosine_epochs - warmup_epochs
+
+            # scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            #     optimizer, T_max=max(1, cosine_epochs)
+            # )
+            scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=cosine_epochs, eta_min=1e-6
+            )
+            scheduler_cooldown = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(1, cooldown_epochs), eta_min=1e-6
+            )
+            # scheduler = SequentialLR(
+            #     optimizer,
+            #     schedulers=[
+            #         LinearLR(optimizer, start_factor=0.3, total_iters=warmup_epochs),
+            #         scheduler_cosine,
+            #         scheduler_cooldown,
+            #     ],
+            #     milestones=[warmup_epochs, warmup_epochs + cosine_epochs],
+            # )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[
+                    LinearLR(optimizer, start_factor=0.3, total_iters=warmup_epochs),
+                    scheduler_cosine,
+                ],
+                milestones=[warmup_epochs],
+            )
+
+            best_val = 0.0
+
+            for epoch in range(args.epochs):
+                print(f"\n[Fold {fold_idx}] Epoch {epoch + 1}/{args.epochs}")
+                train_loss, train_acc, mixup_on, cur_alpha = train_one_epoch(
+                    model, train_loader, optimizer, criterion,
+                    epoch, args.epochs, MIXUP_ALPHA_BASE, DEVICE
+                )
+                val_acc, y_true_fold, y_pred_fold = eval_model(model, val_loader, DEVICE)
+                scheduler.step()
+
+                lr_now = optimizer.param_groups[0]['lr']
+                print(
+                    f"   Train Loss={train_loss:.4f} | "
+                    f"Train Acc={train_acc:.2f}% | "
+                    f"Val Acc={val_acc:.2f}% | LR={lr_now:.6e}"
+                )
+
+                append_global_log(
+                    global_log_path, fold_idx, epoch + 1,
+                    train_loss, train_acc, val_acc,
+                    best_val, mixup_on, cur_alpha,
+                    args.batch_size, lr_now, args.img_size
+                )
+
                 save_checkpoint(
-                    fold_best_path, epoch + 1, model, optimizer, scheduler,
+                    fold_last_path, epoch + 1, model, optimizer, scheduler,
                     best_val, extra={"fold": fold_idx}
                 )
-                print(f"🏅 New best fold-{fold_idx} val: {best_val:.2f}%")
 
-        print(f"✅ Fold {fold_idx} finished. Best val={best_val:.2f}%")
-        fold_accuracies.append(best_val)
-        best_ckpts.append(fold_best_path)
+                if val_acc > best_val:
+                    best_val = val_acc
+                    save_checkpoint(
+                        fold_best_path, epoch + 1, model, optimizer, scheduler,
+                        best_val, extra={"fold": fold_idx}
+                    )
+                    print(f"🏅 New best fold-{fold_idx} val: {best_val:.2f}%")
 
-        # Confusion Matrix option B (top confusions) for fold validation
-        try:
-            load_checkpoint(fold_best_path, model)
-            val_acc_final, y_true_final, y_pred_final = eval_model(model, val_loader, DEVICE)
-            cm = confusion_matrix(y_true_final, y_pred_final, labels=list(range(num_food_classes)))
-            cm_path = os.path.join(fold_dir, f"top10_confusions_fold{fold_idx}.png")
-            plot_top_confusions(cm, food_classes, top_k=10, out_path=cm_path)
-            print(f"📊 Saved top-10 confusion pairs for fold {fold_idx} → {cm_path}")
-        except Exception as e:
-            print(f"⚠️ Failed to save top confusion for fold {fold_idx}: {e}")
+            print(f"✅ Fold {fold_idx} finished. Best val={best_val:.2f}%")
+            fold_accuracies.append(best_val)
+            best_ckpts.append(fold_best_path)
+
+            # Confusion Matrix option B (top confusions) for fold validation
+            try:
+                load_checkpoint(fold_best_path, model)
+                val_acc_final, y_true_final, y_pred_final = eval_model(model, val_loader, DEVICE)
+                cm = confusion_matrix(y_true_final, y_pred_final, labels=list(range(num_food_classes)))
+                cm_path = os.path.join(fold_dir, f"top10_confusions_fold{fold_idx}.png")
+                plot_top_confusions(cm, food_classes, top_k=10, out_path=cm_path)
+                print(f"📊 Saved top-10 confusion pairs for fold {fold_idx} → {cm_path}")
+            except Exception as e:
+                print(f"⚠️ Failed to save top confusion for fold {fold_idx}: {e}")
+    else:
+        print("⚡ Eval-only mode → Loading existing fold checkpoints")
+
+        fold_accuracies = []
+        best_ckpts = []
+
+        for fold_idx in range(1, args.folds + 1):
+
+            fold_dir = os.path.join(args.ckpt_dir, f"fold_{fold_idx}")
+            fold_best_path = os.path.join(
+                fold_dir,
+                f"resnet50_food101_fold{fold_idx}_best.pth"
+            )
+
+            if not os.path.exists(fold_best_path):
+                raise FileNotFoundError(f"Missing checkpoint: {fold_best_path}")
+
+            best_ckpts.append(fold_best_path)
+
+            # load best val accuracy from checkpoint
+            temp_model = build_resnet(num_food_classes).to(DEVICE)
+            _, best_val, _ = load_checkpoint(fold_best_path, temp_model)
+            fold_accuracies.append(best_val)
+        
 
     # --------------------------------------------------------------
     # 3) ENSEMBLE OVER FOLDS (AVERAGE PROBABILITIES) + FOOD-101 TEST EVAL

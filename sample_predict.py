@@ -1,6 +1,3 @@
-# predict_single.py
-# ✅ Consistent with training: checkpoint + val_transform
-
 import torch
 import torch.nn.functional as F
 from torchvision import models
@@ -10,31 +7,46 @@ from PIL import Image
 import os
 
 # ====== Configuration ======
-IMAGE_PATH = "./data/sample-data/pasta2.png"   # your custom test image
-MODEL_PATH = "./checkpoints/resnet50_food101_best.pth"
+IMAGE_PATH = "./data/sample-data/chotputi.jpg"
+MODEL_PATH = "./checkpoints_cv_food_bangla/resnet50_food101_bangla_120.pth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ====== Load class labels from Food101 ======
-class_names = Food101(root="./data", download=False).classes
+# ====== Load Food101 classes ======
+food_classes = Food101(root="./data", download=False).classes
 
-# ====== Define SAME val_transform as training ======
+# ====== Load Bangla classes (from TRAIN folder!) ======
+bangla_train_root = r"E:\er\project-food\data\bangla-food\train"
+bangla_classes = sorted(os.listdir(bangla_train_root))
+
+# Combine in SAME order as training
+class_names = food_classes + bangla_classes
+num_classes = len(class_names)
+
+print(f"Total classes loaded: {num_classes}")
+
+# ====== SAME val_transform as training ======
 val_transform = transforms.Compose([
     transforms.Resize((256, 256)),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225])
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    )
 ])
 
-# ====== Load trained ResNet50 model ======
-model = models.resnet50(weights=None)  # no pretrained weights
-model.fc = torch.nn.Linear(model.fc.in_features, 101)
+# ====== Build 120-class model ======
+model = models.resnet50(weights=None)
+model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
 
-# ✅ load checkpoint exactly as training script saved
+# ====== Load checkpoint ======
 checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
 model.load_state_dict(checkpoint["model_state_dict"])
+
 model = model.to(DEVICE)
 model.eval()
+
+print("Model loaded successfully.")
 
 # ====== Load and process image ======
 image = Image.open(IMAGE_PATH).convert("RGB")
@@ -44,15 +56,14 @@ image_tensor = val_transform(image).unsqueeze(0).to(DEVICE)
 with torch.no_grad():
     outputs = model(image_tensor)
     probs = F.softmax(outputs, dim=1)
-    top3_probs, top3_idxs = torch.topk(probs, k=3, dim=1)
+    top5_probs, top5_idxs = torch.topk(probs, k=5, dim=1)
 
-# ====== Show Top-3 Predictions ======
-print("\n🍽️ Top-3 Predictions:")
-for i in range(3):
-    label = class_names[top3_idxs[0][i].item()]
-    confidence = top3_probs[0][i].item() * 100
+# ====== Show Top-5 Predictions ======
+print("\n🍽️ Top-5 Predictions:")
+for i in range(5):
+    label = class_names[top5_idxs[0][i].item()]
+    confidence = top5_probs[0][i].item() * 100
     print(f"  {i+1}. {label} — {confidence:.2f}%")
 
-# ====== Warning if Low Confidence ======
-if top3_probs[0][0].item() * 100 < 40:
-    print("⚠️ Warning: Low prediction confidence. Might be an unknown class.")
+if top5_probs[0][0].item() * 100 < 40:
+    print("⚠️ Low confidence prediction.")
